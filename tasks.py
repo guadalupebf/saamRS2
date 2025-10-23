@@ -25,11 +25,61 @@ import numpy as np
 from django.conf import settings
 from core.models import Notifications
 from polizas.group_by import polizas_por_aseguradora, polizas_por_ramo, polizas_por_subramo, polizas_por_grupo,polizas_por_estatus, polizas_por_referenciadores, polizas_por_owner,polizas_por_contratante
-from polizas.reports import crea_reporte_agrupado_1p, crea_reporte_agrupado_2p, crea_reporte_agrupado_3p, crea_reporte_agrupado_4p, crea_reporte_agrupado_5p
+from polizas.reports import (
+    crea_reporte_agrupado_1p,
+    crea_reporte_agrupado_2p,
+    crea_reporte_agrupado_3p,
+    crea_reporte_agrupado_4p,
+    crea_reporte_agrupado_5p,
+)
 # from polizas.pyexcelerate_prueba import getPolizasCertificados
 from datetime import datetime, timedelta
 from .models import *
 from django.utils import timezone
+from decimal import Decimal, InvalidOperation
+from typing import Dict, Iterable
+
+
+def _to_decimal(value, default=Decimal("0")):
+    """Return a Decimal representation for aggregation results."""
+    if isinstance(value, Decimal):
+        return value
+    if value in (None, "", False):
+        return default
+    try:
+        return Decimal(str(value))
+    except (InvalidOperation, TypeError, ValueError):
+        return default
+
+
+def _aggregate_currency_totals(polizas_queryset):
+    aggregates = polizas_queryset.aggregate(
+        total=Sum("p_total"),
+        neta=Sum("p_neta"),
+        comision=Sum("comision"),
+    )
+    return {key: _to_decimal(value) for key, value in aggregates.items()}
+
+
+def _build_currency_summary(polizas_queryset):
+    return {
+        "pesos": _aggregate_currency_totals(polizas_queryset.filter(f_currency=1)),
+        "dolares": _aggregate_currency_totals(polizas_queryset.filter(f_currency=2)),
+        "udi": _aggregate_currency_totals(polizas_queryset.filter(f_currency=3)),
+    }
+
+
+def _empty_currency_summary():
+    zero_values = {"total": Decimal("0"), "neta": Decimal("0"), "comision": Decimal("0")}
+    return {key: zero_values.copy() for key in ("pesos", "dolares", "udi")}
+
+
+def _apply_exchange_rate(values: Dict[str, Decimal], keys: Iterable[str], rate):
+    rate = _to_decimal(rate)
+    if not rate:
+        return
+    for key in keys:
+        values[key] = _to_decimal(values.get(key)) * rate
 
 #@shared_task(bind=True)
 @app.task(bind=True, queue=settings.QUEUE)
@@ -98,93 +148,33 @@ def create_report_polizas_task(self, data, es_asincrono):
     view_comision = permiso.get(permission_name = 'Comisiones')
     si_com = view_comision.checked
     try:
-        polizas_pesos = polizas.filter(f_currency =1)
-        p_neta_total_pesos = polizas_pesos.aggregate(Sum('p_neta'))
-        comision_total_pesos = polizas_pesos.aggregate(Sum('comision'))
-        p_total_total_pesos = polizas_pesos.aggregate(Sum('p_total'))
-
-        polizas_dolares = polizas.filter(f_currency =2)
-        p_neta_total_dolares = polizas_dolares.aggregate(Sum('p_neta'))
-        comision_total_dolares = polizas_dolares.aggregate(Sum('comision'))
-        p_total_total_dolares = polizas_dolares.aggregate(Sum('p_total'))
-
-        polizas_udi = polizas.filter(f_currency =3)
-        p_neta_total_udi = polizas_udi.aggregate(Sum('p_neta'))
-        comision_total_udi = polizas_udi.aggregate(Sum('comision'))
-        p_total_total_udi = polizas_udi.aggregate(Sum('p_total'))
-        sumas = {
-            'p_total_total_pesos': p_total_total_pesos['p_total__sum'],
-            'p_neta_total_pesos': p_neta_total_pesos['p_neta__sum'],
-            'comision_total_pesos': comision_total_pesos['comision__sum'],
-            'p_total_total_dolares': p_total_total_dolares['p_total__sum'],
-            'p_neta_total_dolares': p_neta_total_dolares['p_neta__sum'],
-            'comision_total_dolares': comision_total_dolares['comision__sum'],
-            'p_total_total_udi': p_total_total_udi['p_total__sum'],
-            'p_neta_total_udi': p_neta_total_udi['p_neta__sum'],
-            'comision_total_udi': comision_total_udi['comision__sum']
-        }
-        if sumas['p_total_total_dolares'] == None:
-            sumas['p_total_total_dolares'] = float(0)
-        if sumas['p_neta_total_dolares'] == None:
-            sumas['p_neta_total_dolares'] = float(0)
-        if sumas['comision_total_dolares'] == None:
-            sumas['comision_total_dolares'] = float(0)
-
-        if sumas['p_total_total_udi'] == None:
-            sumas['p_total_total_udi'] = float(0)
-        if sumas['p_neta_total_udi'] == None:
-            sumas['p_neta_total_udi'] = float(0)
-        if sumas['comision_total_udi'] == None:
-            sumas['comision_total_udi'] = float(0)
+        currency_summary = _build_currency_summary(polizas)
     except Exception as e:
         print(e)
-        sumas = {}
-    if float(valDolar) == 0.00:
-            sumas = sumas
-    else:
-        try:
-            if sumas['p_total_total_dolares'] != None:
-                    sumas['p_total_total_dolares'] = float(sumas['p_total_total_dolares']) * float(valDolar)
-            else:
-                sumas['p_total_total_dolares'] = float(0)
+        currency_summary = _empty_currency_summary()
 
-            if sumas['p_neta_total_dolares'] != None:
-                    sumas['p_neta_total_dolares'] = float(sumas['p_neta_total_dolares']) * float(valDolar)
-            else:
-                sumas['p_neta_total_dolares'] = float(0)
+    sumas = {
+        'p_total_total_pesos': currency_summary['pesos']['total'],
+        'p_neta_total_pesos': currency_summary['pesos']['neta'],
+        'comision_total_pesos': currency_summary['pesos']['comision'],
+        'p_total_total_dolares': currency_summary['dolares']['total'],
+        'p_neta_total_dolares': currency_summary['dolares']['neta'],
+        'comision_total_dolares': currency_summary['dolares']['comision'],
+        'p_total_total_udi': currency_summary['udi']['total'],
+        'p_neta_total_udi': currency_summary['udi']['neta'],
+        'comision_total_udi': currency_summary['udi']['comision'],
+    }
 
-            if sumas['comision_total_dolares'] != None:
-                sumas['comision_total_dolares'] =grupo1 = []
-                float(sumas['comision_total_dolares']) * float(valDolar)
-            else:
-                sumas['comision_total_dolares'] = float(0)
-
-        except Exception as e:
-                print('------error dolardes--',e)
-                sumas['p_total_total_dolares'] = sumas['p_total_total_dolares']
-                sumas['p_neta_total_dolares'] = sumas['p_neta_total_dolares']
-                sumas['comision_total_dolares'] = sumas['comision_total_dolares']
-    if float(valUdi) == 0.00:
-            sumas = sumas
-    else:
-        try:
-            if sumas['p_total_total_udi'] != None:
-                    sumas['p_total_total_udi'] = float(sumas['p_total_total_udi']) * float(valUdi)
-            else:
-                sumas['p_total_total_udi'] = float(0)
-            if sumas['p_neta_total_udi'] != None:
-                    sumas['p_neta_total_udi'] = float(sumas['p_neta_total_udi']) * float(valUdi)
-            else:
-                sumas['p_neta_total_udi'] = float(0)
-            if sumas['comision_total_udi'] != None:
-                    sumas['comision_total_udi'] = float(sumas['comision_total_udi']) * float(valUdi)
-            else:
-                sumas['comision_total_udi'] = float(0)
-        except Exception as e:
-            print('-------eror UDI',e)
-            sumas['p_total_total_udi'] = sumas['p_total_total_udi']
-            sumas['p_neta_total_udi'] = sumas['p_neta_total_udi']
-            sumas['comision_total_udi'] = sumas['comision_total_udi']
+    _apply_exchange_rate(
+        sumas,
+        ('p_total_total_dolares', 'p_neta_total_dolares', 'comision_total_dolares'),
+        valDolar,
+    )
+    _apply_exchange_rate(
+        sumas,
+        ('p_total_total_udi', 'p_neta_total_udi', 'comision_total_udi'),
+        valUdi,
+    )
     # Estilo General
     
     # Excel agrupado
